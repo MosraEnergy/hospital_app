@@ -218,7 +218,7 @@ with tab_entry:
             
         notes = st.text_area("Clinical Notes & Observation Assessments", placeholder="Type out detailed patient complaints, treatment plans, or ongoing observation adjustments.")
         
-        submit_btn = st.form_submit_form_button("Commit Entry to Ledger Database")
+        submit_btn = st.form_submit_button("Commit Entry to Ledger Database")
         
         if submit_btn:
             if not p_name.strip():
