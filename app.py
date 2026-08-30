@@ -80,7 +80,7 @@ def save_visit(data):
     finally:
         db.close()
 
-@st.cache_data(ttl=60)  # cache for 1 minute
+@st.cache_data(ttl=60)
 def load_data_dataframe(start_date=None, end_date=None):
     db = SessionLocal()
     try:
@@ -290,6 +290,20 @@ with tab_dashboard:
             else:
                 st.info("No incidents in this period.")
 
+        # ----------------------------
+        # 3b. NEW: Bar chart of incidents per day (clearer view)
+        # ----------------------------
+        st.markdown("#### 📅 Incidents by Date (Bar Chart)")
+        if not incident_daily.empty:
+            fig_inc_bar = px.bar(incident_daily, x="Date", y="Incidents",
+                                 title="Incident Count per Day",
+                                 color="Incidents", color_continuous_scale="Reds",
+                                 hover_data={"Incidents": True})
+            fig_inc_bar.update_layout(showlegend=False)
+            st.plotly_chart(fig_inc_bar, use_container_width=True)
+        else:
+            st.info("No incidents to display in this bar chart.")
+
         st.markdown("---")
 
         # ----------------------------
@@ -479,9 +493,9 @@ with tab_entry:
 
 
 # ==========================================
-# 5. SEED DATA BUTTON (with Designation)
+# 5. SEED DATA BUTTON (with random timestamps)
 # ==========================================
-if st.button("Seed Database with 20 Sample Records"):
+if st.button("Seed Database with 20 Sample Records (random dates)"):
     names = [
         "Chuka Obi", "Amina Bello", "Emeka Uba", "Sarah Johnson", "Michael Eze", 
         "Fatima Aliyu", "David Smith", "Ngozi Okafor", "Tunde Bakare", "John Doe", 
@@ -495,7 +509,17 @@ if st.button("Seed Database with 20 Sample Records"):
         "Musculoskeletal Pain / Trauma", "Skin Infection", "Other Operational/Routine Encounter"
     ]
     
+    # Define date range: July 30, 2026 to August 30, 2026
+    start_seed = datetime(2026, 7, 30, 0, 0, 0)
+    end_seed = datetime(2026, 8, 30, 23, 59, 59)
+    delta_days = (end_seed - start_seed).days
+
     for name in names:
+        # Random timestamp within the range
+        rand_days = random.randint(0, delta_days)
+        rand_seconds = random.randint(0, 86400)  # seconds in a day
+        random_timestamp = start_seed + timedelta(days=rand_days, seconds=rand_seconds)
+        
         is_incident = 1 if random.random() < 0.2 else 0
         inc_type = random.choice(["Minor Injury Case", "Major (LTI)"]) if is_incident else None
         dx = "Musculoskeletal Pain / Trauma" if is_incident else random.choice(diagnoses)
@@ -517,6 +541,7 @@ if st.button("Seed Database with 20 Sample Records"):
             days = 0
             
         payload = {
+            "timestamp": random_timestamp,  # <-- added random timestamp
             "patient_name": name,
             "age": random.randint(22, 60),
             "gender": random.choice(["Male", "Female"]),
@@ -537,4 +562,4 @@ if st.button("Seed Database with 20 Sample Records"):
         
         save_visit(payload)
         
-    st.success("20 robust sample records successfully injected! Please refresh the page to see your dashboard light up.")
+    st.success("20 sample records with random dates (July 30 – Aug 30, 2026) successfully injected! Please refresh the page to see your dashboard light up.")
