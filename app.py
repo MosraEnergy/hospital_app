@@ -220,10 +220,10 @@ with tab_dashboard:
 
         # Display KPI cards with trend arrows
         col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
-        col1.metric("Total Visits", total_visits, delta=f"{trend_total:.1f}%")
+        col1.metric("Total Visits", total_visits, delta=f"{trend_total:.1f}% from last month")
         col2.metric("Admissions", admissions)
         col3.metric("Referrals", referrals)
-        col4.metric("Incidents", incidents, delta=f"{incidents/total_visits*100:.1f}% of visits")
+        col4.metric("Incidents", incidents, delta=f"{incidents/total_visits*100:.1f}% from last month")
         col5.metric("LTI (Major)", lti_cases)
         col6.metric("Avg Hours/Visit", f"{avg_hours:.1f}h")
         col7.metric("Avg Days Admitted", f"{avg_days:.1f}d" if avg_days > 0 else "N/A")
