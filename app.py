@@ -1,565 +1,322 @@
-import streamlit as st
+import os
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, inspect, text
-from sqlalchemy.orm import declarative_base, sessionmaker
-import random
+import streamlit as st
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-# ==========================================
-# 1. CLOUD DATABASE CONFIGURATION (SECURE)
-# ==========================================
-try:
-    DATABASE_URL = st.secrets["DATABASE_URL"]
-except (KeyError, AttributeError):
-    DATABASE_URL = "sqlite:///clinic_operations.db"
+from analytics import ADMISSIONS, daily_counts, diagnosis_counts, filter_visits, outcomes, visit_frame
+from clinic_data import ClinicStore, clean_diagnoses, file_number, make_engine
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    connect_args={"sslmode": "require"} if "postgresql" in DATABASE_URL else {}
-)
-Base = declarative_base()
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+st.set_page_config(page_title="Company Clinic", page_icon="🏥", layout="wide")
+LOCAL_TZ = ZoneInfo("Africa/Lagos")
+DIAGNOSES = ["Malaria", "Hypertension (Elevated BP)", "Peptic Ulcer Disease (PUD)",
+             "Typhoid Fever", "Upper Respiratory Tract Infection (URTI)",
+             "Musculoskeletal Pain / Trauma", "Skin Infection", "Other Operational/Routine Encounter"]
+GENDERS = ["Male", "Female", "Other", "Not recorded"]
 
 
-class PatientVisit(Base):
-    __tablename__ = "patient_visits"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    patient_name = Column(String(100), nullable=False)
-    age = Column(Integer, nullable=False)
-    gender = Column(String(20), nullable=False)
-    employee_designation = Column(String(100), nullable=True)
-    
-    systolic_bp = Column(Integer, nullable=True)
-    diastolic_bp = Column(Integer, nullable=True)
-    temperature_c = Column(Float, nullable=True)
-    pulse_rate = Column(Integer, nullable=True)
-    
-    primary_diagnosis = Column(String(100), nullable=False)
-    is_admission = Column(String(50), default="No Entry")
-    is_referral = Column(Integer, default=0)
-    
-    is_incident = Column(Integer, default=0)
-    incident_type = Column(String(50), nullable=True)
-    clinical_notes = Column(Text, nullable=True)
-    
-    hours_in_clinic = Column(Float, nullable=True, default=0.0)
-    days_admitted = Column(Integer, nullable=True, default=0)
+@st.cache_resource
+def get_store():
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        try:
+            url = st.secrets.get("DATABASE_URL")
+        except FileNotFoundError:
+            url = None
+    return ClinicStore(make_engine(url or "sqlite:///clinic_operations.db"))
 
 
-# ==========================================
-# 2. DATABASE MIGRATION HELPER
-# ==========================================
-def add_column_if_not_exists(table_name, column):
-    inspector = inspect(engine)
-    existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
-    if column.name not in existing_columns:
-        with engine.connect() as conn:
-            col_type = str(column.type)
-            alter_stmt = text(f"ALTER TABLE {table_name} ADD COLUMN {column.name} {col_type}")
-            conn.execute(alter_stmt)
-            conn.commit()
-
-Base.metadata.create_all(bind=engine)
-add_column_if_not_exists("patient_visits", PatientVisit.employee_designation)
+def refresh(message):
+    st.session_state["notice"] = message
+    st.rerun()
 
 
-# ==========================================
-# 3. HELPER FUNCTIONS (DATA LAYER)
-# ==========================================
-def save_visit(data):
-    db = SessionLocal()
-    try:
-        db_visit = PatientVisit(**data)
-        db.add(db_visit)
-        db.commit()
-    finally:
-        db.close()
-
-@st.cache_data(ttl=60)
-def load_data_dataframe(start_date=None, end_date=None):
-    db = SessionLocal()
-    try:
-        query = db.query(PatientVisit)
-        if start_date:
-            query = query.filter(PatientVisit.timestamp >= start_date)
-        if end_date:
-            query = query.filter(PatientVisit.timestamp <= end_date)
-        results = query.all()
-    finally:
-        db.close()
-    
-    if not results:
-        return pd.DataFrame()
-        
-    data = []
-    for item in results:
-        data.append({
-            "ID": item.id,
-            "Timestamp": item.timestamp,
-            "Date": item.timestamp.strftime("%Y-%m-%d %H:%M") if item.timestamp else "N/A",
-            "Patient Name": item.patient_name,
-            "Age": item.age,
-            "Gender": item.gender,
-            "Designation": item.employee_designation,
-            "Systolic": item.systolic_bp,
-            "Diastolic": item.diastolic_bp,
-            "Temp (°C)": item.temperature_c,
-            "Diagnosis": item.primary_diagnosis,
-            "Admission Status": item.is_admission,
-            "Referral": "Yes" if item.is_referral == 1 else "No",
-            "Incident Case": "Yes" if item.is_incident == 1 else "No",
-            "Incident Type": item.incident_type if item.is_incident == 1 else "N/A",
-            "Hours in Clinic": item.hours_in_clinic,
-            "Days Admitted": item.days_admitted,
-            "Notes": item.clinical_notes
-        })
-    df = pd.DataFrame(data)
-    if not df.empty and "Timestamp" in df.columns:
-        df["Timestamp"] = pd.to_datetime(df["Timestamp"])
-    return df
+def patient_label(patient):
+    reference = f" · {patient.employee_id}" if patient.employee_id else ""
+    return f"{file_number(patient.id)} · {patient.name}{reference}"
 
 
-# ==========================================
-# 4. STREAMLIT INTERFACE (UI LAYER)
-# ==========================================
-st.set_page_config(page_title="Clinic Operations System", layout="wide", page_icon="🏥")
-st.title("🏥 Site Clinic Intelligence System")
-st.markdown("---")
+def visit_label(visit):
+    stamp = visit["timestamp"]
+    date = stamp.strftime("%d %b %Y, %H:%M") if pd.notna(stamp) else "Date not recorded"
+    return f"Visit #{visit['id']} · {date} · {', '.join(visit['diagnoses'])}"
 
-# ------------------------------------------
-# SIDEBAR FILTERS
-# ------------------------------------------
-st.sidebar.header("🔍 Filters")
 
-# Date range
-default_end = datetime.now()
-default_start = default_end - timedelta(days=30)
-start_date = st.sidebar.date_input("Start Date", default_start)
-end_date = st.sidebar.date_input("End Date", default_end)
+def display_visit(visit):
+    st.write("**Diagnoses:** " + "; ".join(visit["diagnoses"]))
+    a, b, c, d = st.columns(4)
+    bp = f"{visit['systolic_bp']:g}/{visit['diastolic_bp']:g}" if pd.notna(visit['systolic_bp']) and pd.notna(visit['diastolic_bp']) else "Not recorded"
+    a.metric("Blood pressure (mmHg)", bp)
+    b.metric("Temperature (°C)", f"{visit['temperature_c']:g}" if pd.notna(visit['temperature_c']) else "Not recorded")
+    c.metric("Pulse (bpm)", f"{visit['pulse_rate']:g}" if pd.notna(visit['pulse_rate']) else "Not recorded")
+    d.metric("Age at visit", visit["age"])
+    st.write(f"**Admission:** {'No admission' if visit['admission'] == 'No Entry' else visit['admission']} · **Referral:** {'Yes' if visit['referral'] else 'No'}")
+    if visit["incident"]:
+        st.write(f"**Workplace incident:** {visit['incident_type'] or 'Classification not recorded'}")
+    st.text(visit["notes"] or "No clinical notes recorded.")
+    for note in store.notes(int(visit["id"])):
+        stamp = note.timestamp.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
+        st.caption(f"Follow-up · {stamp:%d %b %Y, %H:%M} · {note.author}")
+        st.text(note.text)
 
-start_dt = datetime.combine(start_date, datetime.min.time()) if start_date else None
-end_dt = datetime.combine(end_date, datetime.max.time()) if end_date else None
 
-# Load main data
-df = load_data_dataframe(start_dt, end_dt)
-
-if df.empty:
-    st.sidebar.warning("No records for the selected period.")
-else:
-    # Additional filters (populated from the dataframe)
-    designation_options = ["All"] + sorted(df["Designation"].dropna().unique().tolist())
-    diagnosis_options = ["All"] + sorted(df["Diagnosis"].unique().tolist())
-    incident_options = ["All", "Yes", "No"]
-    
-    selected_designation = st.sidebar.selectbox("Designation", designation_options)
-    selected_diagnosis = st.sidebar.selectbox("Diagnosis", diagnosis_options)
-    selected_incident = st.sidebar.selectbox("Incident Case", incident_options)
-    
-    # Apply filters
-    filtered_df = df.copy()
-    if selected_designation != "All":
-        filtered_df = filtered_df[filtered_df["Designation"] == selected_designation]
-    if selected_diagnosis != "All":
-        filtered_df = filtered_df[filtered_df["Diagnosis"] == selected_diagnosis]
-    if selected_incident != "All":
-        filtered_df = filtered_df[filtered_df["Incident Case"] == selected_incident]
-    
-    # Reset filters button
-    if st.sidebar.button("Reset Filters"):
-        st.rerun()
-    
-    st.sidebar.markdown("---")
-    st.sidebar.caption(f"Showing {len(filtered_df)} records")
-
-    # Use filtered_df for dashboard
-    df_display = filtered_df
-
-# ------------------------------------------
-# TABS
-# ------------------------------------------
-tab_dashboard, tab_entry = st.tabs(["📊 Real-Time Analytics Dashboard", "📝 Nurse Intake Registry"])
-
-# ==========================================
-# TAB 1: DASHBOARD (OVERHAULED)
-# ==========================================
-with tab_dashboard:
-    if df_display.empty:
-        st.info("No records match the current filters. Adjust your filters or add new data.")
+def intake(patients):
+    st.header("Record a visit")
+    st.caption("Select the patient file first. Leave unmeasured vital signs blank.")
+    if not patients:
+        st.info("Create a patient file in Patient files before recording a visit.")
+        return
+    by_id = {p.id: p for p in patients}
+    patient_id = st.selectbox("Patient file", list(by_id), format_func=lambda i: patient_label(by_id[i]), key="intake_patient")
+    history = [v for v in records if v["patient_id"] == patient_id]
+    if history:
+        latest = history[0]
+        st.info(f"{len(history)} previous visit(s). Latest: {visit_label(latest)}")
+        with st.expander("Review previous visits"):
+            for visit in history[:5]:
+                st.write(visit_label(visit))
+            st.caption("Full history and follow-up notes are in Patient files.")
     else:
-        df = df_display  # for brevity
-        
-        # ----------------------------
-        # 1. COMPUTE KPIs & TRENDS
-        # ----------------------------
-        total_visits = len(df)
-        admissions = len(df[df["Admission Status"].isin(["Standard Admission", "Short-Day Admission"])])
-        referrals = len(df[df["Referral"] == "Yes"])
-        incidents = len(df[df["Incident Case"] == "Yes"])
-        lti_cases = len(df[df["Incident Type"] == "Major (LTI)"])
-        avg_hours = df["Hours in Clinic"].mean() if not df["Hours in Clinic"].isna().all() else 0
-        avg_days = df[df["Days Admitted"] > 0]["Days Admitted"].mean() if not df[df["Days Admitted"] > 0].empty else 0
-
-        # Compare with previous period (e.g., same length, previous 30 days)
-        if start_dt and end_dt:
-            period_length = (end_dt - start_dt).days
-            prev_start = start_dt - timedelta(days=period_length)
-            prev_end = start_dt - timedelta(days=1)
-            df_prev = load_data_dataframe(prev_start, prev_end)
-            if not df_prev.empty:
-                prev_total = len(df_prev)
-                trend_total = (total_visits - prev_total) / prev_total * 100 if prev_total > 0 else 0
+        st.caption("No previous visits linked to this file.")
+    form_key = f"visit_form_{patient_id}_{st.session_state.get('visit_version', 0)}"
+    with st.form(form_key):
+        left, right = st.columns(2)
+        now = datetime.now(LOCAL_TZ)
+        with left:
+            visit_date = st.date_input("Visit date", value=now.date(), max_value=now.date())
+            visit_time = st.time_input("Visit time (Lagos)", value=now.time().replace(second=0, microsecond=0))
+            age = st.number_input("Age at this visit (years)", min_value=0, max_value=120, value=None, step=1)
+            diagnoses = st.multiselect("Diagnoses / presentations", DIAGNOSES)
+            custom = st.text_area("Other diagnoses", placeholder="Enter one diagnosis per line", help="These are saved alongside the selected diagnoses and included in reports.")
+        with right:
+            st.subheader("Vital signs")
+            s, d = st.columns(2)
+            sys = s.number_input("Systolic BP (mmHg)", min_value=1, max_value=350, value=None, step=1)
+            dia = d.number_input("Diastolic BP (mmHg)", min_value=1, max_value=250, value=None, step=1)
+            temp = st.number_input("Temperature (°C)", min_value=20.0, max_value=50.0, value=None, step=0.1)
+            pulse = st.number_input("Pulse (bpm)", min_value=1, max_value=350, value=None, step=1)
+            admission = st.selectbox("Admission", ["No admission", "Short-Day Admission", "Standard Admission"])
+            referral = st.checkbox("Referred to another facility")
+            incident = st.selectbox("Workplace incident", ["Not incident-related", "Minor Injury Case", "Major (LTI)"])
+        notes = st.text_area("Clinical notes / treatment", placeholder="Complaints, findings, treatment and follow-up plan")
+        if st.form_submit_button("Save visit", type="primary"):
+            try:
+                diagnosis_list = clean_diagnoses(diagnoses, custom)
+                stamp = datetime.combine(visit_date, visit_time, tzinfo=LOCAL_TZ)
+                if stamp > datetime.now(LOCAL_TZ):
+                    raise ValueError("Visit date and time cannot be in the future.")
+                visit_id = store.save_visit(patient_id, {
+                    "timestamp": stamp.astimezone(timezone.utc).replace(tzinfo=None), "age": age,
+                    "systolic_bp": sys, "diastolic_bp": dia, "temperature_c": temp, "pulse_rate": pulse,
+                    "is_admission": "No Entry" if admission == "No admission" else admission,
+                    "is_referral": int(referral), "is_incident": int(incident != "Not incident-related"),
+                    "incident_type": None if incident == "Not incident-related" else incident,
+                    "clinical_notes": notes.strip(),
+                }, diagnosis_list)
+            except ValueError as exc:
+                st.error(str(exc))
+            except SQLAlchemyError:
+                st.error("The visit could not be saved. Your entries are still here; check the database connection and retry.")
             else:
-                trend_total = 0
+                st.session_state["visit_version"] = st.session_state.get("visit_version", 0) + 1
+                refresh(f"Visit #{visit_id} saved to {file_number(patient_id)}.")
+
+
+def patient_files(patients):
+    st.header("Patient files")
+    st.caption("Find a file by name, file number or employee reference. Confirm identity before adding information.")
+    with st.expander("Create a patient file", expanded=not patients):
+        with st.form(f"register_{st.session_state.get('register_version', 0)}"):
+            name = st.text_input("Full name", max_chars=100)
+            gender = st.selectbox("Gender", GENDERS, index=3)
+            reference = st.text_input("Employee / patient reference (optional)", max_chars=80)
+            st.caption("Check existing files before registering. People with the same name keep separate file numbers.")
+            if st.form_submit_button("Create file", type="primary"):
+                try:
+                    patient_id = store.register_patient(name, gender, reference)
+                except ValueError as exc:
+                    st.error(str(exc))
+                except IntegrityError:
+                    st.error("That employee / patient reference already has a file. Find and use the existing file.")
+                except SQLAlchemyError:
+                    st.error("The patient file could not be saved. Please retry.")
+                else:
+                    st.session_state["register_version"] = st.session_state.get("register_version", 0) + 1
+                    st.session_state["file_patient"] = patient_id
+                    refresh(f"Patient file {file_number(patient_id)} created.")
+    if not patients:
+        return
+    by_id = {p.id: p for p in patients}
+    patient_id = st.selectbox("Find patient", list(by_id), format_func=lambda i: patient_label(by_id[i]), key="file_patient")
+    patient = by_id[patient_id]
+    st.subheader(patient_label(patient))
+    st.caption(f"Gender: {patient.gender}")
+    history = [v for v in records if v["patient_id"] == patient_id]
+    st.metric("Recorded visits", len(history))
+    if history:
+        known = sorted({d for v in history for d in v["diagnoses"]}, key=str.casefold)
+        st.write("**Previously recorded diagnoses:** " + "; ".join(known))
+        st.caption("Historical diagnoses are encounter records, not a current problem list.")
+        st.dataframe(pd.DataFrame([{
+            "Visit": v["id"],
+            "Date (Lagos)": v["timestamp"].strftime("%Y-%m-%d %H:%M") if pd.notna(v["timestamp"]) else "Not recorded",
+            "Diagnoses": "; ".join(v["diagnoses"]),
+            "Admission": "No admission" if v["admission"] == "No Entry" else v["admission"],
+            "Referral": "Yes" if v["referral"] else "No",
+        } for v in history]), hide_index=True, use_container_width=True)
+        visit_map = {v["id"]: v for v in history}
+        visit_id = st.selectbox("Visit details", list(visit_map), format_func=lambda i: visit_label(visit_map[i]), key=f"details_{patient_id}")
+        display_visit(visit_map[visit_id])
+        st.subheader("Add follow-up information")
+        st.caption(f"Adding to visit #{visit_id} above. New notes are dated and appended; the original visit remains available.")
+        with st.form(f"follow_up_{patient_id}_{visit_id}_{st.session_state.get('note_version', 0)}"):
+            author = st.text_input("Recorded by", max_chars=100)
+            note = st.text_area("Follow-up note", placeholder="Subsequent findings, treatment changes, or a correction to the original record")
+            if st.form_submit_button("Add follow-up note"):
+                try:
+                    store.add_note(int(visit_id), author, note)
+                except ValueError as exc:
+                    st.error(str(exc))
+                except SQLAlchemyError:
+                    st.error("The note could not be saved. Your text is still here; please retry.")
+                else:
+                    st.session_state["note_version"] = st.session_state.get("note_version", 0) + 1
+                    refresh("Follow-up note added.")
+    else:
+        st.info("No visits yet. Use Record a visit to add the first encounter.")
+    unlinked = [v for v in records if pd.isna(v["patient_id"])]
+    if unlinked:
+        with st.expander(f"Link an existing visit ({len(unlinked)} unlinked)"):
+            st.caption("Older records remain unlinked until staff confirm identity. Matching names alone do not establish identity.")
+            visits_by_id = {v["id"]: v for v in unlinked}
+            visit_id = st.selectbox("Existing visit", list(visits_by_id), format_func=lambda i: f"{visits_by_id[i]['patient_name']} · {visit_label(visits_by_id[i])}")
+            display_visit(visits_by_id[visit_id])
+            confirmed = st.checkbox(f"I have confirmed this visit belongs to {patient_label(patient)}", key=f"confirm_{visit_id}_{patient_id}")
+            if st.button("Link visit to this file", disabled=not confirmed):
+                try:
+                    store.link_visit(int(visit_id), patient_id)
+                except ValueError as exc:
+                    st.error(str(exc))
+                except SQLAlchemyError:
+                    st.error("The visit could not be linked. Refresh and retry.")
+                else:
+                    refresh("Existing visit linked. Its original details have been preserved.")
+
+
+def chart(figure):
+    figure.update_layout(template="plotly_white", margin=dict(l=10, r=10, t=20, b=10),
+                         font=dict(size=13), showlegend=False, height=330)
+    if figure.data and figure.data[0].orientation == "h":
+        figure.update_xaxes(rangemode="tozero", dtick=1 if max(figure.data[0].x, default=0) < 10 else None)
+    elif figure.data:
+        figure.update_yaxes(rangemode="tozero", dtick=1 if max(figure.data[0].y, default=0) < 10 else None)
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def dashboard(frame):
+    st.header("Clinic overview")
+    st.caption("Attendance, care outcomes and workplace incidents. All figures use the selected visit dates (Lagos time).")
+    if frame.empty:
+        st.info("No visits recorded yet. Create a patient file, then record a visit to start reporting.")
+        return
+    today = datetime.now(LOCAL_TZ).date()
+    undated = int(frame.timestamp.isna().sum())
+    if undated:
+        st.warning(f"{undated} visit(s) have no recorded date and cannot be included in date-based reports. They remain available in patient files.")
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", value=today - timedelta(days=29))
+    end = c2.date_input("To", value=today)
+    if start > end:
+        st.error("The start date must be on or before the end date.")
+        return
+    filtered = filter_visits(frame, start, end)
+    if filtered.empty:
+        st.info("No visits in this date range. Choose a wider range to see older records.")
+        return
+    total = len(filtered)
+    cards = st.columns(5)
+    for col, label, value in zip(cards, ["Visits", "Linked patients seen", "Admissions", "Referrals", "Workplace incidents"],
+                                  [total, filtered.patient_id.nunique(), filtered.admission.isin(ADMISSIONS).sum(), filtered.referral.sum(), filtered.incident.sum()]):
+        col.metric(label, int(value))
+    missing = int(filtered.patient_id.isna().sum())
+    st.caption(f"{missing} unlinked visit(s) excluded from the patient count. Admissions and referrals count encounters, not current bed occupancy.")
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Clinic attendance over time")
+        daily = daily_counts(filtered, start, end)
+        if len(daily) > 90:
+            daily["Date"] = pd.to_datetime(daily["Date"])
+            daily = daily.set_index("Date").resample("W-MON", label="left", closed="left").sum().reset_index()
+            st.caption("Weekly totals; first and last weeks may be partial.")
         else:
-            trend_total = 0
-
-        # Display KPI cards with trend arrows
-        col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
-        col1.metric("Total Visits", total_visits, delta=f"{trend_total:.1f}% from last month")
-        col2.metric("Admissions", admissions)
-        col3.metric("Referrals", referrals)
-        col4.metric("Incidents", incidents, delta=f"{incidents/total_visits*100:.1f}% from last month")
-        col5.metric("LTI (Major)", lti_cases)
-        col6.metric("Avg Hours/Visit", f"{avg_hours:.1f}h")
-        col7.metric("Avg Days Admitted", f"{avg_days:.1f}d" if avg_days > 0 else "N/A")
-        st.markdown("---")
-
-        # ----------------------------
-        # 2. ROW 1: TOP DIAGNOSES & VISITS BY DESIGNATION
-        # ----------------------------
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            dx_counts = df["Diagnosis"].value_counts().reset_index()
-            dx_counts.columns = ["Diagnosis", "Count"]
-            # Add incident flag for colour
-            dx_incident = df[df["Incident Case"] == "Yes"]["Diagnosis"].value_counts().reset_index()
-            dx_incident.columns = ["Diagnosis", "Incident_Count"]
-            dx_counts = dx_counts.merge(dx_incident, on="Diagnosis", how="left").fillna(0)
-            dx_counts["Incident_Count"] = dx_counts["Incident_Count"].astype(int)
-            
-            fig_dx = px.bar(dx_counts, x="Count", y="Diagnosis", orientation='h',
-                            title="Leading Causes of Clinic Attendance",
-                            color="Incident_Count", color_continuous_scale="Reds",
-                            hover_data={"Incident_Count": True})
-            fig_dx.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False)
-            st.plotly_chart(fig_dx, use_container_width=True)
-
-        with chart_col2:
-            # Visits by Designation, split by incident
-            des_counts = df.groupby(["Designation", "Incident Case"]).size().reset_index(name="Count")
-            fig_des = px.bar(des_counts, x="Designation", y="Count", color="Incident Case",
-                             title="Visits by Designation (Incident vs Non‑Incident)",
-                             barmode="stack", color_discrete_map={"Yes": "#d62728", "No": "#2ca02c"})
-            st.plotly_chart(fig_des, use_container_width=True)
-
-        st.markdown("---")
-
-        # ----------------------------
-        # 3. ROW 2: TIME-SERIES WITH ROLLING AVERAGES
-        # ----------------------------
-        time_col1, time_col2 = st.columns(2)
-        with time_col1:
-            # Daily visit trend with 7-day rolling average
-            daily = df.groupby(df["Timestamp"].dt.date).size().reset_index(name="Visits")
-            daily.columns = ["Date", "Visits"]
-            daily = daily.sort_values("Date")
-            daily["7-day MA"] = daily["Visits"].rolling(window=7, min_periods=1).mean()
-            fig_daily = px.line(daily, x="Date", y=["Visits", "7-day MA"],
-                                title="Daily Visits & 7‑Day Rolling Average",
-                                markers=True, color_discrete_map={"Visits": "#1f77b4", "7-day MA": "#ff7f0e"})
-            st.plotly_chart(fig_daily, use_container_width=True)
-
-        with time_col2:
-            # Daily incident trend with rolling average
-            incident_daily = df[df["Incident Case"] == "Yes"].groupby(df["Timestamp"].dt.date).size().reset_index(name="Incidents")
-            incident_daily.columns = ["Date", "Incidents"]
-            if not incident_daily.empty:
-                incident_daily = incident_daily.sort_values("Date")
-                incident_daily["7-day MA"] = incident_daily["Incidents"].rolling(window=7, min_periods=1).mean()
-                fig_inc = px.line(incident_daily, x="Date", y=["Incidents", "7-day MA"],
-                                  title="Daily Incident Cases & 7‑Day MA",
-                                  markers=True, color_discrete_map={"Incidents": "#d62728", "7-day MA": "#9467bd"})
-                # Add threshold line (e.g., 2 incidents/day)
-                fig_inc.add_hline(y=2, line_dash="dash", line_color="red", opacity=0.5, annotation_text="Alert threshold")
-                st.plotly_chart(fig_inc, use_container_width=True)
-            else:
-                st.info("No incidents in this period.")
-
-        # ----------------------------
-        # 3b. NEW: Bar chart of incidents per day (clearer view)
-        # ----------------------------
-        st.markdown("#### 📅 Incidents by Date (Bar Chart)")
-        if not incident_daily.empty:
-            fig_inc_bar = px.bar(incident_daily, x="Date", y="Incidents",
-                                 title="Incident Count per Day",
-                                 color="Incidents", color_continuous_scale="Reds",
-                                 hover_data={"Incidents": True})
-            fig_inc_bar.update_layout(showlegend=False)
-            st.plotly_chart(fig_inc_bar, use_container_width=True)
+            st.caption("Daily visits, including days with zero attendance.")
+        chart(px.bar(daily, x="Date", y="Visits", color_discrete_sequence=["#157f83"]))
+    with right:
+        st.subheader("Most frequent diagnoses")
+        counts = diagnosis_counts(filtered)
+        top = counts.head(10).sort_values("Visits")
+        st.caption("Top 10 by visits. A visit with multiple diagnoses contributes to each diagnosis.")
+        chart(px.bar(top, x="Visits", y="Diagnosis", orientation="h", text="Visits", color_discrete_sequence=["#2864b4"]))
+        with st.expander("All diagnoses and visit percentages"):
+            counts["% of visits"] = (counts.Visits / total * 100).round(1)
+            st.dataframe(counts, hide_index=True, use_container_width=True)
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Admission outcomes")
+        chart(px.bar(outcomes(filtered), x="Outcome", y="Visits", text="Visits", color_discrete_sequence=["#157f83"]))
+        st.caption(f"Referred onward: {int(filtered.referral.sum())} of {total} visits ({filtered.referral.mean():.0%}). Referrals can also involve admission.")
+    with right:
+        st.subheader("Workplace incident classifications")
+        incidents = filtered[filtered.incident]
+        if incidents.empty:
+            st.info("No workplace incidents recorded in this period.")
         else:
-            st.info("No incidents to display in this bar chart.")
-
-        st.markdown("---")
-
-        # ----------------------------
-        # 4. ROW 3: LENGTH OF STAY & WATCHLIST
-        # ----------------------------
-        stay_col1, stay_col2 = st.columns(2)
-        with stay_col1:
-            # Boxplot of Hours in Clinic by Diagnosis with jitter and admission colour
-            df_hours = df[df["Hours in Clinic"].notna()].copy()
-            if not df_hours.empty:
-                fig_box = px.box(df_hours, x="Diagnosis", y="Hours in Clinic", points="all",
-                                 color="Admission Status", hover_data=["Patient Name"],
-                                 title="Consultation Duration by Diagnosis")
-                fig_box.update_layout(showlegend=True)
-                st.plotly_chart(fig_box, use_container_width=True)
-            else:
-                st.write("No hours data available.")
-
-        with stay_col2:
-            # Top 10 prolonged admissions
-            admitted = df[df["Days Admitted"] > 0].copy()
-            if not admitted.empty:
-                top_admitted = admitted.nlargest(10, "Days Admitted")[["Patient Name", "Days Admitted", "Diagnosis"]]
-                fig_stay = px.bar(top_admitted, x="Days Admitted", y="Patient Name", orientation='h',
-                                  color="Diagnosis", title="Top 10 Longest Admissions",
-                                  hover_data={"Days Admitted": True}, text_auto=True)
-                fig_stay.update_layout(yaxis={'categoryorder':'total ascending'})
-                st.plotly_chart(fig_stay, use_container_width=True)
-                # Watchlist: show patients admitted >3 days
-                watchlist = df[df["Days Admitted"] > 3][["Patient Name", "Days Admitted", "Diagnosis", "Admission Status"]]
-                if not watchlist.empty:
-                    st.markdown("#### ⚠️ Prolonged Stay Watchlist (>3 days)")
-                    st.dataframe(watchlist, use_container_width=True)
-            else:
-                st.success("No prolonged admissions (>0 days) in this period.")
-
-        st.markdown("---")
-
-        # ----------------------------
-        # 5. ROW 4: INCIDENT DEEP-DIVE
-        # ----------------------------
-        inc_col1, inc_col2 = st.columns(2)
-        with inc_col1:
-            # Incident severity pie
-            incident_df = df[df["Incident Case"] == "Yes"]
-            if not incident_df.empty:
-                severity_counts = incident_df["Incident Type"].value_counts().reset_index()
-                severity_counts.columns = ["Severity", "Count"]
-                fig_pie = px.pie(severity_counts, values="Count", names="Severity",
-                                 title="Incident Severity Distribution",
-                                 color_discrete_map={"Minor Injury Case": "#ffa600", "Major (LTI)": "#d62728"})
-                st.plotly_chart(fig_pie, use_container_width=True)
-            else:
-                st.info("No incidents to display.")
-
-        with inc_col2:
-            # Incident rate by designation (incidents / total visits per role)
-            des_total = df.groupby("Designation").size().reset_index(name="Total")
-            des_incident = df[df["Incident Case"] == "Yes"].groupby("Designation").size().reset_index(name="Incidents")
-            des_rate = des_total.merge(des_incident, on="Designation", how="left").fillna(0)
-            des_rate["Rate (%)"] = (des_rate["Incidents"] / des_rate["Total"]) * 100
-            des_rate = des_rate.sort_values("Rate (%)", ascending=False)
-            fig_rate = px.bar(des_rate, x="Rate (%)", y="Designation", orientation='h',
-                              title="Incident Rate by Designation (% of visits)",
-                              color="Rate (%)", color_continuous_scale="Reds")
-            fig_rate.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_rate, use_container_width=True)
-
-        st.markdown("---")
-
-        # ----------------------------
-        # 6. ROW 5: HEATMAP – Day vs Hour
-        # ----------------------------
-        if not df.empty and "Timestamp" in df.columns:
-            df["Hour"] = df["Timestamp"].dt.hour
-            df["DayOfWeek"] = df["Timestamp"].dt.day_name()
-            # Order days
-            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            df["DayOfWeek"] = pd.Categorical(df["DayOfWeek"], categories=day_order, ordered=True)
-            # Aggregate counts per hour and day
-            heatmap_data = df.groupby(["DayOfWeek", "Hour"], observed=True).size().reset_index(name="Visits")
-            # Pivot for heatmap
-            pivot = heatmap_data.pivot(index="DayOfWeek", columns="Hour", values="Visits").fillna(0)
-            fig_heat = px.imshow(pivot, text_auto=True, aspect="auto",
-                                 color_continuous_scale="Blues",
-                                 title="Visit Volume Heatmap (Day of Week vs Hour of Day)")
-            fig_heat.update_xaxes(title="Hour of Day")
-            fig_heat.update_yaxes(title="Day of Week")
-            st.plotly_chart(fig_heat, use_container_width=True)
-
-        st.markdown("---")
-
-        # ----------------------------
-        # 7. FILTERABLE PATIENT REGISTRY
-        # ----------------------------
-        st.subheader("📋 Patient Registry (Filtered View)")
-        # Search box
-        search = st.text_input("Search by Patient Name", "")
-        registry_df = df[["Date", "Patient Name", "Designation", "Diagnosis", "Incident Case", "Hours in Clinic", "Days Admitted", "Notes"]]
-        if search:
-            registry_df = registry_df[registry_df["Patient Name"].str.contains(search, case=False)]
-        st.dataframe(registry_df, use_container_width=True)
+            severity = incidents.incident_type.fillna("Not classified").value_counts().rename_axis("Classification").reset_index(name="Visits")
+            chart(px.bar(severity, x="Classification", y="Visits", text="Visits", color_discrete_sequence=["#b87524"]))
+        st.caption("Counts reflect incident-related visits. Repeat visits may relate to the same incident; LTI is the recorded classification.")
+    with st.expander("Vital sign documentation"):
+        st.caption("Documentation coverage for this period. This measures recording completeness, not clinical risk.")
+        coverage = pd.DataFrame({"Measurement": ["Blood pressure (both readings)", "Temperature", "Pulse"],
+                                 "Visits recorded": [int((filtered.systolic_bp.notna() & filtered.diastolic_bp.notna()).sum()),
+                                                    int(filtered.temperature_c.notna().sum()), int(filtered.pulse_rate.notna().sum())]})
+        coverage["% of visits"] = (coverage["Visits recorded"] / total * 100).round(1)
+        st.dataframe(coverage, hide_index=True, use_container_width=True)
+        st.caption("Older entries may contain default vital signs from the previous form.")
+    with st.expander("Visit register for this period"):
+        view = filtered.copy()
+        view["Patient file"] = view.patient_id.map(lambda i: file_number(int(i)) if pd.notna(i) else "Unlinked")
+        view["Diagnoses"] = view.diagnoses.map("; ".join)
+        view["Date (Lagos)"] = view.timestamp.dt.strftime("%Y-%m-%d %H:%M")
+        view = view.rename(columns={"id": "Visit", "patient_name": "Patient", "admission": "Admission", "referral": "Referral", "incident": "Incident"})
+        st.dataframe(view[["Visit", "Patient file", "Date (Lagos)", "Patient", "Diagnoses", "Admission", "Referral", "Incident"]], hide_index=True, use_container_width=True)
 
 
-# ==========================================
-# TAB 2: NURSE INTAKE REGISTRY FORM
-# ==========================================
-with tab_entry:
-    st.subheader("New Patient Clinical Record Entry")
-    
-    with st.form("patient_intake_form", clear_on_submit=True):
-        form_col1, form_col2, form_col3 = st.columns(3)
-        
-        with form_col1:
-            st.markdown("##### **Demographic Info**")
-            p_name = st.text_input("Patient Full Name", placeholder="Surname first")
-            p_age = st.number_input("Age", min_value=0, max_value=120, step=1, value=25)
-            p_gender = st.selectbox("Gender", ["Male", "Female", "Other"])
-            p_designation = st.text_input("Employee Designation (Role/Department)", placeholder="e.g., Nurse, Engineer, Admin")
-            
-        with form_col2:
-            st.markdown("##### **Clinical Vitals**")
-            sys_bp = st.number_input("Systolic BP (mmHg)", min_value=50, max_value=250, value=120)
-            dia_bp = st.number_input("Diastolic BP (mmHg)", min_value=30, max_value=150, value=80)
-            temp_c = st.number_input("Temperature (°C)", min_value=30.0, max_value=45.0, step=0.1, value=36.5)
-            pulse = st.number_input("Pulse Rate (bpm)", min_value=30, max_value=200, value=75)
-            
-        with form_col3:
-            st.markdown("##### **Diagnosis & Classifications**")
-            dx = st.selectbox("Primary Diagnosis/Presentation", [
-                "Malaria", 
-                "Hypertension (Elevated BP)", 
-                "Peptic Ulcer Disease (PUD)", 
-                "Typhoid Fever", 
-                "Upper Respiratory Tract Infection (URTI)", 
-                "Musculoskeletal Pain / Trauma", 
-                "Skin Infection", 
-                "Other Operational/Routine Encounter"
-            ])
-            admission_status = st.selectbox("Admission Strategy", ["No Entry", "Short-Day Admission", "Standard Admission"])
-            is_ref = st.checkbox("Escalate as a Referral Outward Case")
-            
-        st.markdown("---")
-        
-        # Duration and Incident Tracking
-        dur_col1, dur_col2 = st.columns(2)
-        
-        with dur_col1:
-            st.markdown("##### **Time Tracking**")
-            hrs_spent = st.number_input("Hours Spent in Clinic (Outpatient/Consultation)", min_value=0.0, max_value=24.0, step=0.5, value=0.5)
-            days_spent = st.number_input("Days Admitted (Leave at 0 if not admitted)", min_value=0, max_value=30, step=1, value=0)
-            
-        with dur_col2:
-            st.markdown("##### **Workplace Incident Logging**")
-            has_incident = st.checkbox("Is this visit related to a workplace incident/injury?")
-            inc_type = st.selectbox("Incident Severity Classification", ["Minor Injury Case", "Major (LTI)"]) if has_incident else None
-            
-        notes = st.text_area("Clinical Notes & Observation Assessments", placeholder="Type out detailed patient complaints, treatment plans, or ongoing observation adjustments.")
-        
-        submit_btn = st.form_submit_button("Commit Entry to Ledger Database")
-        
-        if submit_btn:
-            if not p_name.strip():
-                st.error("Submission blocked: Patient Name cannot be left completely blank.")
-            else:
-                payload = {
-                    "patient_name": p_name,
-                    "age": p_age,
-                    "gender": p_gender,
-                    "employee_designation": p_designation if p_designation.strip() else None,
-                    "systolic_bp": sys_bp,
-                    "diastolic_bp": dia_bp,
-                    "temperature_c": temp_c,
-                    "pulse_rate": pulse,
-                    "primary_diagnosis": dx,
-                    "is_admission": admission_status,
-                    "is_referral": 1 if is_ref else 0,
-                    "is_incident": 1 if has_incident else 0,
-                    "incident_type": inc_type,
-                    "hours_in_clinic": hrs_spent,
-                    "days_admitted": days_spent,
-                    "clinical_notes": notes
-                }
-                save_visit(payload)
-                st.success(f"Log Successfully Generated for {p_name}. Database updated instantly.")
-                st.rerun()
+st.title("🏥 Company Clinic")
+st.caption("Patient care • Visit history • Clinic reporting")
+if "notice" in st.session_state:
+    st.success(st.session_state.pop("notice"))
+try:
+    store = get_store()
+    patients = store.patients()
+    frame = visit_frame(store.visits())
+    records = frame.to_dict("records") if not frame.empty else []
+except SQLAlchemyError:
+    st.error("The clinic database is unavailable. Check the database connection and reload.")
+    st.stop()
 
-
-# ==========================================
-# 5. SEED DATA BUTTON (with random timestamps)
-# ==========================================
-if st.button("Seed Database with 20 Sample Records (random dates)"):
-    names = [
-        "Chuka Obi", "Amina Bello", "Emeka Uba", "Sarah Johnson", "Michael Eze", 
-        "Fatima Aliyu", "David Smith", "Ngozi Okafor", "Tunde Bakare", "John Doe", 
-        "Jane Smith", "Musa Ibrahim", "Grace Nwachukwu", "Peter Ojo", "Aisha Yusuf", 
-        "Samuel Kalu", "Chidinma Nwosu", "Oluwaseun Adeyemi", "Kabir Danladi", "Victoria Coker"
-    ]
-    designations = ["Nurse", "Doctor", "Engineer", "Admin", "Technician", "Manager", "Operator"]
-    diagnoses = [
-        "Malaria", "Hypertension (Elevated BP)", "Peptic Ulcer Disease (PUD)", 
-        "Typhoid Fever", "Upper Respiratory Tract Infection (URTI)", 
-        "Musculoskeletal Pain / Trauma", "Skin Infection", "Other Operational/Routine Encounter"
-    ]
-    
-    # Define date range: July 30, 2026 to August 30, 2026
-    start_seed = datetime(2026, 7, 30, 0, 0, 0)
-    end_seed = datetime(2026, 8, 30, 23, 59, 59)
-    delta_days = (end_seed - start_seed).days
-
-    for name in names:
-        # Random timestamp within the range
-        rand_days = random.randint(0, delta_days)
-        rand_seconds = random.randint(0, 86400)  # seconds in a day
-        random_timestamp = start_seed + timedelta(days=rand_days, seconds=rand_seconds)
-        
-        is_incident = 1 if random.random() < 0.2 else 0
-        inc_type = random.choice(["Minor Injury Case", "Major (LTI)"]) if is_incident else None
-        dx = "Musculoskeletal Pain / Trauma" if is_incident else random.choice(diagnoses)
-        
-        if dx == "Hypertension (Elevated BP)":
-            sys_bp = random.randint(140, 185)
-            dia_bp = random.randint(90, 115)
-        else:
-            sys_bp = random.randint(100, 135)
-            dia_bp = random.randint(60, 85)
-            
-        temp = round(random.uniform(38.0, 39.8), 1) if dx in ["Malaria", "Typhoid Fever"] else round(random.uniform(36.1, 37.3), 1)
-        
-        if random.random() < 0.25:
-            admission = random.choice(["Short-Day Admission", "Standard Admission"])
-            days = random.randint(1, 5) if admission == "Standard Admission" else 0
-        else:
-            admission = "No Entry"
-            days = 0
-            
-        payload = {
-            "timestamp": random_timestamp,  # <-- added random timestamp
-            "patient_name": name,
-            "age": random.randint(22, 60),
-            "gender": random.choice(["Male", "Female"]),
-            "employee_designation": random.choice(designations),
-            "systolic_bp": sys_bp,
-            "diastolic_bp": dia_bp,
-            "temperature_c": temp,
-            "pulse_rate": random.randint(65, 110),
-            "primary_diagnosis": dx,
-            "is_admission": admission,
-            "is_referral": 1 if random.random() < 0.1 else 0,
-            "is_incident": is_incident,
-            "incident_type": inc_type,
-            "hours_in_clinic": round(random.uniform(0.5, 5.0), 1),
-            "days_admitted": days,
-            "clinical_notes": f"Sample generated record for {dx}." if not is_incident else f"Incident report: {inc_type}. Monitoring applied."
-        }
-        
-        save_visit(payload)
-        
-    st.success("20 sample records with random dates (July 30 – Aug 30, 2026) successfully injected! Please refresh the page to see your dashboard light up.")
+page = st.sidebar.radio("Workspace", ["Clinic overview", "Record a visit", "Patient files"])
+st.sidebar.caption("All displayed dates and times use Africa/Lagos.")
+if st.sidebar.button("Refresh records"):
+    st.rerun()
+try:
+    if page == "Clinic overview":
+        dashboard(frame)
+    elif page == "Record a visit":
+        intake(patients)
+    else:
+        patient_files(patients)
+except SQLAlchemyError:
+    st.error("Records could not be loaded. Check the database connection and refresh.")
